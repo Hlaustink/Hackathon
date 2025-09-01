@@ -1,3 +1,4 @@
+# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import mysql.connector
@@ -18,9 +19,7 @@ db_config = {
     'user': os.getenv('DB_USER', 'root'),
     'password': os.getenv('DB_PASSWORD', '1234'),
     'host': os.getenv('DB_HOST', 'localhost'),
-    'database': os.getenv('DB_NAME', 'flashcard_app'),
-    'pool_name': 'flashcard_pool',
-    'pool_size': 5
+    'database': os.getenv('DB_NAME', 'flashcard_app')
 }
 
 # --- HUGGING FACE API CONFIGURATION ---
@@ -28,8 +27,56 @@ HF_TOKEN = os.getenv('HUGGING_FACE_TOKEN')
 if not HF_TOKEN:
     raise ValueError("HUGGING_FACE_TOKEN environment variable not set.")
     
-HF_API_URL = "https://api-inference.huggingface.co/models/mrm8488/t5-base-finetuned-question-generation-ap"
+# Using a more reliable model
+HF_API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-base"
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+
+# --- DATABASE INITIALIZATION ---
+def initialize_default_deck():
+    """Ensure a default deck and user exist in the database."""
+    conn = None
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor()
+        
+        # Check if default user exists, create if not
+        cursor.execute("SELECT id FROM users WHERE id = 1")
+        user_result = cursor.fetchone()
+        
+        if not user_result:
+            # Create a default user
+            cursor.execute(
+                "INSERT INTO users (id, username, email, password_hash) VALUES (%s, %s, %s, %s)",
+                (1, 'default_user', 'demo@example.com', 'demo_password_hash')
+            )
+            print("Default user created successfully!")
+        
+        # Check if default deck already exists
+        cursor.execute("SELECT id FROM decks WHERE id = 1")
+        deck_result = cursor.fetchone()
+        
+        if not deck_result:
+            # Create a default deck if it doesn't exist
+            cursor.execute(
+                "INSERT INTO decks (id, user_id, title, description) VALUES (%s, %s, %s, %s)",
+                (1, 1, 'Default Deck', 'Automatically created default deck for flashcards')
+            )
+            conn.commit()
+            print("Default deck created successfully!")
+        else:
+            print("Default deck already exists.")
+            
+    except mysql.connector.Error as e:
+        print(f"Error initializing default deck: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# Initialize the default deck when the app starts
+initialize_default_deck()
 
 # --- UTILITY FUNCTIONS ---
 def clean_text(text):
@@ -41,16 +88,23 @@ def clean_text(text):
 def split_into_sentences(text):
     """Split text into sentences using basic punctuation."""
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    return [s for s in sentences if s and len(s.split()) > 5] # Ensure meaningful sentences
+    return [s for s in sentences if s and len(s.split()) > 3]  # Reduced to 3 words minimum
 
 def generate_question(context):
     """Generate a question using Hugging Face Inference API with a fallback."""
     try:
-        response = requests.post(HF_API_URL, headers=HF_HEADERS, json={"inputs": f"generate question: {context}"}, timeout=10)
+        # Updated prompt for the new model
+        response = requests.post(HF_API_URL, headers=HF_HEADERS, 
+                               json={"inputs": f"Generate a question about: {context}"}, 
+                               timeout=15)  # Increased timeout
         response.raise_for_status()
         result = response.json()
+        
         if result and isinstance(result, list) and 'generated_text' in result[0]:
             return result[0]['generated_text']
+        elif isinstance(result, dict) and 'generated_text' in result:
+            return result['generated_text']
+            
     except requests.exceptions.RequestException as e:
         print(f"Hugging Face API error: {e}")
     
@@ -70,13 +124,11 @@ def store_flashcards(flashcards):
     # SQL statement with placeholders for security
     sql = "INSERT INTO flashcards (deck_id, question, answer) VALUES (%s, %s, %s)"
     
-    # Prepare data for bulk insert
-    # Using deck_id = 1 as default; this could be made dynamic
+    # Prepare data for bulk insert - using deck_id = 1 which now exists
     data_to_insert = [(1, card['question'], card['answer']) for card in flashcards]
 
     conn = None
     try:
-        # Get a connection from the pool
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor()
         
@@ -84,11 +136,10 @@ def store_flashcards(flashcards):
         cursor.executemany(sql, data_to_insert)
         
         conn.commit()
-        print(f"{cursor.rowcount} flashcards stored successfully!")
+        print(f"{cursor.rowcount} flashcards stored successfully in database!")
         
     except mysql.connector.Error as e:
         print(f"Database error: {e}")
-        # Optionally roll back changes if something goes wrong
         if conn:
             conn.rollback()
     finally:
@@ -135,13 +186,30 @@ def health_check():
         conn = mysql.connector.connect(**db_config)
         if conn.is_connected():
             conn.close()
-            db_status = 'connected'
-        else:
-            db_status = 'disconnected'
-    except mysql.connector.Error:
-        db_status = 'error'
+            return jsonify({'status': 'healthy', 'database': 'connected'})
+    except mysql.connector.Error as e:
+        return jsonify({'status': 'healthy', 'database': 'error', 'message': str(e)})
         
-    return jsonify({'status': 'healthy', 'database_status': db_status})
+    return jsonify({'status': 'healthy', 'database': 'unknown'})
+
+@app.route('/flashcards', methods=['GET'])
+def get_flashcards():
+    """Endpoint to retrieve all flashcards from the database."""
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True)
+        
+        cursor.execute("SELECT question, answer FROM flashcards")
+        flashcards = cursor.fetchall()
+        
+        return jsonify({'flashcards': flashcards})
+        
+    except mysql.connector.Error as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
