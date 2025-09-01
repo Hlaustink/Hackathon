@@ -22,7 +22,7 @@ db_config = {
 }
 
 # Hugging Face API configuration
-HF_TOKEN = os.getenv('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')
+HF_TOKEN = os.getenv('HUGGING_FACE_TOKEN')
 HF_API_URL = "https://api-inference.huggingface.co/models/mrm8488/t5-base-finetuned-question-generation-ap"
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 
